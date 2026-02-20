@@ -2,7 +2,7 @@
 """Telegram polling daemon for Claude Code bridge.
 
 Polls Telegram for incoming messages from forum topics, maps topic_id
-to session, and injects text into the correct Zellij pane.
+to session, and injects text into the correct tmux session.
 
 Usage:
     python3 daemon.py start     # Start as background daemon
@@ -141,95 +141,66 @@ def send_to_general(text, parse_mode="HTML"):
         logger.error(f"Failed to send to general: {e}")
 
 
-def zellij_write_bytes(env, *byte_args):
-    """Write raw bytes to a Zellij session."""
-    subprocess.run(
-        ["zellij", "action", "write"] + [str(b) for b in byte_args],
-        env=env, timeout=5, capture_output=True,
-    )
-
-
-def is_zellij_session_alive(zellij_session):
-    """Check if a Zellij session has an attached terminal.
-
-    Detached sessions have a server but Claude Code gets suspended (SIGTSTP).
-    Only sessions with an 'attach' process have an active Claude Code.
-    """
+def is_session_alive(session_name):
+    """Check if a tmux session exists and is running."""
     try:
         result = subprocess.run(
-            ["pgrep", "-af", "zellij"],
-            capture_output=True, text=True, timeout=5,
+            ["tmux", "has-session", "-t", session_name],
+            capture_output=True, timeout=5,
         )
-        for line in result.stdout.splitlines():
-            if f"attach {zellij_session}" in line:
-                return True
-        return False
+        return result.returncode == 0
     except Exception:
         return False
 
 
-def inject_into_zellij(zellij_session, text):
-    """Inject text into a Zellij session via write-chars + Enter."""
-    env = os.environ.copy()
-    env["ZELLIJ_SESSION_NAME"] = zellij_session
-
+def inject_into_session(session_name, text):
+    """Inject text into a tmux session via send-keys + Enter."""
     try:
         subprocess.run(
-            ["zellij", "action", "write-chars", text],
-            env=env, timeout=5, capture_output=True,
+            ["tmux", "send-keys", "-t", session_name, text, "Enter"],
+            timeout=5, capture_output=True,
         )
-        zellij_write_bytes(env, 13)
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        logger.error(f"Zellij injection failed for {zellij_session}: {e}")
+        logger.error(f"tmux injection failed for {session_name}: {e}")
         return False
 
 
-def inject_selection_into_zellij(zellij_session, index, num_defined_options=4):
+def inject_selection_into_session(session_name, index, num_defined_options=4):
     """Select an option in AskUserQuestion UI.
-
-    Claude Code's Select context accepts:
-    - Number keys (1-9) to jump to defined options
-    - Arrow Down/Up (or J/K) to navigate
-    - Enter to confirm
 
     Defined options (index < num_defined_options) use number keys.
     Built-in options (Other, Chat) use arrow navigation.
     """
-    env = os.environ.copy()
-    env["ZELLIJ_SESSION_NAME"] = zellij_session
-
     try:
         if index < num_defined_options:
-            # Defined options: use number key (1-indexed)
             number = str(index + 1)
             subprocess.run(
-                ["zellij", "action", "write-chars", number],
-                env=env, timeout=5, capture_output=True,
+                ["tmux", "send-keys", "-t", session_name, number],
+                timeout=5, capture_output=True,
             )
         else:
-            # Built-in options (Other, Chat): navigate with arrow keys
-            # Down arrow = ESC [ B = bytes 27 91 66
             for _ in range(index):
-                zellij_write_bytes(env, 27, 91, 66)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Down"],
+                    timeout=5, capture_output=True,
+                )
                 time.sleep(0.05)
-            # Press Enter
-            zellij_write_bytes(env, 13)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                timeout=5, capture_output=True,
+            )
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        logger.error(f"Zellij selection failed for {zellij_session}: {e}")
+        logger.error(f"tmux selection failed for {session_name}: {e}")
         return False
 
 
-def inject_permission_into_zellij(zellij_session, choice):
+def inject_permission_into_session(session_name, choice):
     """Handle permission prompt selection using number keys.
 
-    Permission prompt order is always: 1=Yes, 2=Always Allow, 3=No
-    Uses same number key approach as AskUserQuestion (proven to work).
+    Permission prompt order: 1=Yes, 2=Always Allow, 3=No
     """
-    env = os.environ.copy()
-    env["ZELLIJ_SESSION_NAME"] = zellij_session
-
     perm_map = {"yes": "1", "always": "2", "no": "3"}
     number = perm_map.get(choice)
     if not number:
@@ -237,41 +208,40 @@ def inject_permission_into_zellij(zellij_session, choice):
 
     try:
         subprocess.run(
-            ["zellij", "action", "write-chars", number],
-            env=env, timeout=5, capture_output=True,
+            ["tmux", "send-keys", "-t", session_name, number],
+            timeout=5, capture_output=True,
         )
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        logger.error(f"Zellij permission failed for {zellij_session}: {e}")
+        logger.error(f"tmux permission failed for {session_name}: {e}")
         return False
 
 
 def handle_sessions_command(topic_id=None):
-    """Handle /tel_sessions command — list Zellij sessions."""
+    """Handle /tel_sessions command — list tmux sessions."""
     try:
         result = subprocess.run(
-            ["zellij", "list-sessions", "--short"],
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
             capture_output=True, text=True, timeout=5,
         )
-        zellij_sessions = [s.strip() for s in result.stdout.strip().splitlines() if s.strip()]
+        tmux_sessions = [s.strip() for s in result.stdout.strip().splitlines() if s.strip()]
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        zellij_sessions = []
+        tmux_sessions = []
 
-    if not zellij_sessions:
-        send_to_topic(topic_id, "No Zellij sessions found.")
+    if not tmux_sessions:
+        send_to_topic(topic_id, "No tmux sessions found.")
         return
 
-    # Load bridge sessions for extra info
     bridge_sessions = load_sessions()
 
-    lines = ["<b>Zellij Sessions:</b>"]
-    for zs in zellij_sessions:
-        info = bridge_sessions.get(zs, {})
+    lines = ["<b>Sessions:</b>"]
+    for ts in tmux_sessions:
+        info = bridge_sessions.get(ts, {})
         active = info.get("active", False)
         has_topic = "\u2705" if info.get("topic_id") else "\u2796"
         cwd = info.get("cwd", "")
         status = "\U0001F7E2" if active else "\u26aa"
-        line = f"\n{status} <b>{zs}</b> {has_topic}"
+        line = f"\n{status} <b>{ts}</b> {has_topic}"
         if cwd:
             line += f"\n  <i>{cwd}</i>"
         lines.append(line)
@@ -293,18 +263,17 @@ def handle_rename_command(topic_id, args_text):
         send_to_topic(topic_id, "\u26a0\ufe0f No session linked to this topic.")
         return
 
-    zellij_session = session_info.get("zellij_session", "")
-    if not zellij_session:
-        send_to_topic(topic_id, "\u26a0\ufe0f Session has no Zellij session.")
+    tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
+    if not tmux_session:
+        send_to_topic(topic_id, "\u26a0\ufe0f Session has no tmux session.")
         return
 
-    # Zellij doesn't have a native rename command — update the bridge mapping
-    # and rename the Telegram topic
+    # Update the bridge mapping and rename the Telegram topic
     sessions = load_sessions()
 
     # Update sessions.json: move entry to new name
     old_info = sessions.pop(session_name, {})
-    old_info["zellij_session"] = zellij_session  # Zellij session name stays the same
+    old_info["tmux_session"] = tmux_session
     sessions[new_name] = old_info
     save_sessions(sessions)
 
@@ -397,13 +366,13 @@ def process_message(message):
         send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> is not active.")
         return
 
-    zellij_session = session_info.get("zellij_session", "")
-    if not zellij_session:
-        send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> has no Zellij session.")
+    tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
+    if not tmux_session:
+        send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> has no tmux session.")
         return
 
-    if not is_zellij_session_alive(zellij_session):
-        send_to_topic(topic_id, f"\u26a0\ufe0f <b>{zellij_session}</b> has no open terminal. Claude is suspended.\nAttach with: <code>zellij attach {zellij_session}</code>")
+    if not is_session_alive(tmux_session):
+        send_to_topic(topic_id, f"\u26a0\ufe0f <b>{tmux_session}</b> is not running.\nStart with: <code>tmux new -s {tmux_session} 'claude -r'</code>")
         return
 
     msg_id = message.get("message_id")
@@ -411,24 +380,24 @@ def process_message(message):
     # Claude Code slash commands: forward as-is (no [Telegram] prefix)
     if is_claude_cmd:
         slash_cmd = f"/{cmd_word}"
-        if inject_into_zellij(zellij_session, slash_cmd):
+        if inject_into_session(tmux_session, slash_cmd):
             react_to_message(msg_id, "\U0001F44D")  # Received
             set_busy(session_name, msg_id)
             react_to_message(msg_id, "\U0001F440")  # Busy
-            logger.info(f"Claude command injected into {zellij_session}: {slash_cmd}")
+            logger.info(f"Claude command injected into {tmux_session}: {slash_cmd}")
         else:
-            send_to_topic(topic_id, f"\u274c Failed to send. Is the Zellij session alive?")
+            send_to_topic(topic_id, f"\u274c Failed to send.")
         return
 
-    # Inject into Zellij with [Telegram] prefix
+    # Inject with [Telegram] prefix
     prefixed_text = f"[Telegram] {text}"
-    if inject_into_zellij(zellij_session, prefixed_text):
+    if inject_into_session(tmux_session, prefixed_text):
         react_to_message(msg_id, "\U0001F44D")  # Received
         set_busy(session_name, msg_id)
         react_to_message(msg_id, "\U0001F440")  # Busy
-        logger.info(f"Injected into {zellij_session}: {prefixed_text}")
+        logger.info(f"Injected into {tmux_session}: {prefixed_text}")
     else:
-        send_to_topic(topic_id, f"\u274c Failed to send. Is the Zellij session alive?")
+        send_to_topic(topic_id, f"\u274c Failed to send.")
 
 
 def process_callback_query(callback_query):
@@ -461,11 +430,11 @@ def process_callback_query(callback_query):
         return
 
     session_info = sessions[session_name]
-    zellij_session = session_info.get("zellij_session", "")
+    tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
     topic_id = session_info.get("topic_id")
 
-    if not zellij_session:
-        telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "No Zellij session"})
+    if not tmux_session:
+        telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "No tmux session"})
         return
 
     action_type = parts[1] if len(parts) >= 3 else "text"
@@ -484,13 +453,13 @@ def process_callback_query(callback_query):
 
     if action_type == "perm":
         # Permission prompt: use Y/N keys or arrow navigation
-        if inject_permission_into_zellij(zellij_session, action_value):
+        if inject_permission_into_session(tmux_session, action_value):
             if cb_msg_id:
                 set_busy(session_name, cb_msg_id)
                 react_to_message(cb_msg_id, "\U0001F440")
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Selected: {button_text[:50]}"})
             send_to_topic(topic_id, f"\u2705 Selected: <code>{button_text[:100]}</code>")
-            logger.info(f"Permission '{action_value}' injected into {zellij_session}")
+            logger.info(f"Permission '{action_value}' injected into {tmux_session}")
         else:
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Failed to send"})
             send_to_topic(topic_id, f"\u274c Failed to send.")
@@ -504,21 +473,21 @@ def process_callback_query(callback_query):
 
         num_defined = int(parts[3]) if len(parts) >= 4 else 99
 
-        if inject_selection_into_zellij(zellij_session, index, num_defined):
+        if inject_selection_into_session(tmux_session, index, num_defined):
             if cb_msg_id:
                 set_busy(session_name, cb_msg_id)
                 react_to_message(cb_msg_id, "\U0001F440")
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Selected: {button_text[:50]}"})
             send_to_topic(topic_id, f"\u2705 Selected: <code>{button_text[:100]}</code>")
-            logger.info(f"Selection {index} injected into {zellij_session}: {button_text}")
+            logger.info(f"Selection {index} injected into {tmux_session}: {button_text}")
         else:
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Failed to send"})
             send_to_topic(topic_id, f"\u274c Failed to send.")
     else:
-        if inject_into_zellij(zellij_session, action_value):
+        if inject_into_session(tmux_session, action_value):
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Sent: {action_value[:50]}"})
             send_to_topic(topic_id, f"\u2705 <code>{action_value[:100]}</code>")
-            logger.info(f"Button tap injected into {zellij_session}: {action_value}")
+            logger.info(f"Button tap injected into {tmux_session}: {action_value}")
         else:
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Failed to send"})
             send_to_topic(topic_id, f"\u274c Failed to send.")

@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import fcntl
+import subprocess
 import urllib.request
 import urllib.error
 import logging
@@ -39,7 +40,18 @@ def load_config():
 
 
 def get_session_name():
-    """Derive session name from ZELLIJ_SESSION_NAME env var."""
+    """Derive session name from tmux or Zellij env vars."""
+    # Try tmux first
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    # Fallback to Zellij
     zellij_name = os.environ.get("ZELLIJ_SESSION_NAME", "")
     if zellij_name:
         return zellij_name

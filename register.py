@@ -10,6 +10,7 @@ import os
 import sys
 import fcntl
 import subprocess
+import shlex
 import urllib.request
 import urllib.error
 import time
@@ -75,7 +76,18 @@ def close_forum_topic(config, topic_id):
 
 
 def get_session_name():
-    """Derive session name from ZELLIJ_SESSION_NAME env var."""
+    """Derive session name from tmux or Zellij env vars."""
+    # Try tmux first
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    # Fallback to Zellij
     zellij_name = os.environ.get("ZELLIJ_SESSION_NAME", "")
     if zellij_name:
         return zellij_name
@@ -135,7 +147,7 @@ def main():
     session_id = hook_input.get("session_id", "unknown")
     cwd = hook_input.get("cwd", "")
     session_name = get_session_name()
-    zellij_session = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    tmux_session = session_name or ""
 
     if not session_name:
         session_name = session_id[:8] if session_id != "unknown" else f"session_{int(time.time())}"
@@ -155,7 +167,7 @@ def main():
 
         sessions[session_name] = {
             "session_id": session_id,
-            "zellij_session": zellij_session,
+            "tmux_session": tmux_session,
             "cwd": cwd,
             "topic_id": topic_id,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
