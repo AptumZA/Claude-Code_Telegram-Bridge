@@ -17,7 +17,6 @@ import sys
 import signal
 import time
 import subprocess
-import threading
 import urllib.request
 import urllib.error
 import fcntl
@@ -50,62 +49,27 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
 
-def set_busy(session_name, topic_id):
-    """Mark a session as busy (Claude is processing)."""
+def set_busy(session_name, message_id):
+    """Mark a session as busy with the message_id to react to."""
     os.makedirs(BUSY_DIR, exist_ok=True)
     path = os.path.join(BUSY_DIR, session_name)
     with open(path, "w") as f:
-        f.write(str(topic_id))
+        f.write(str(message_id))
 
 
-def clear_busy(session_name):
-    """Clear busy marker for a session."""
-    path = os.path.join(BUSY_DIR, session_name)
+def react_to_message(message_id, emoji):
+    """Set a reaction emoji on a message."""
     try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-
-
-def get_busy_sessions():
-    """Get dict of busy session_name -> topic_id."""
-    try:
-        entries = os.listdir(BUSY_DIR)
-    except FileNotFoundError:
-        return {}
-    result = {}
-    for name in entries:
-        path = os.path.join(BUSY_DIR, name)
-        try:
-            with open(path) as f:
-                topic_id = int(f.read().strip())
-            result[name] = topic_id
-        except (ValueError, FileNotFoundError):
-            pass
-    return result
-
-
-def send_typing_action(topic_id):
-    """Send 'typing' chat action to a forum topic."""
-    try:
-        params = {"chat_id": GROUP_CHAT_ID, "action": "typing"}
-        if topic_id:
-            params["message_thread_id"] = topic_id
-        telegram_api("sendChatAction", params)
-    except Exception:
-        pass  # Best effort
-
-
-def typing_indicator_loop():
-    """Background thread: sends typing indicators for busy sessions every 4s."""
-    while True:
-        try:
-            busy = get_busy_sessions()
-            for session_name, topic_id in busy.items():
-                send_typing_action(topic_id)
-        except Exception as e:
-            logger.error(f"Typing indicator error: {e}")
-        time.sleep(4)
+        result = telegram_api("setMessageReaction", {
+            "chat_id": GROUP_CHAT_ID,
+            "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": emoji}],
+        })
+        logger.info(f"Reacted to msg {message_id} with {emoji}: {result.get('ok')}")
+        return True
+    except Exception as e:
+        logger.error(f"setMessageReaction failed for msg {message_id} emoji={emoji}: {e}")
+        return False
 
 
 def load_sessions():
@@ -183,6 +147,19 @@ def zellij_write_bytes(env, *byte_args):
         ["zellij", "action", "write"] + [str(b) for b in byte_args],
         env=env, timeout=5, capture_output=True,
     )
+
+
+def is_zellij_session_alive(zellij_session):
+    """Check if a Zellij session exists and is running."""
+    try:
+        result = subprocess.run(
+            ["zellij", "list-sessions", "--short"],
+            capture_output=True, text=True, timeout=5,
+        )
+        sessions = [s.strip() for s in result.stdout.strip().splitlines()]
+        return zellij_session in sessions
+    except Exception:
+        return False
 
 
 def inject_into_zellij(zellij_session, text):
@@ -419,13 +396,19 @@ def process_message(message):
         send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> has no Zellij session.")
         return
 
+    if not is_zellij_session_alive(zellij_session):
+        send_to_topic(topic_id, f"\u26a0\ufe0f Zellij session <b>{zellij_session}</b> is not running. Open a terminal with this session first.")
+        return
+
+    msg_id = message.get("message_id")
+
     # Claude Code slash commands: forward as-is (no [Telegram] prefix)
     if is_claude_cmd:
         slash_cmd = f"/{cmd_word}"
         if inject_into_zellij(zellij_session, slash_cmd):
-            set_busy(session_name, topic_id)
-            send_typing_action(topic_id)
-            send_to_topic(topic_id, f"\u2705 <code>{slash_cmd}</code>")
+            react_to_message(msg_id, "\U0001F44D")  # Received
+            set_busy(session_name, msg_id)
+            react_to_message(msg_id, "\U0001F440")  # Busy
             logger.info(f"Claude command injected into {zellij_session}: {slash_cmd}")
         else:
             send_to_topic(topic_id, f"\u274c Failed to send. Is the Zellij session alive?")
@@ -434,9 +417,9 @@ def process_message(message):
     # Inject into Zellij with [Telegram] prefix
     prefixed_text = f"[Telegram] {text}"
     if inject_into_zellij(zellij_session, prefixed_text):
-        set_busy(session_name, topic_id)
-        send_typing_action(topic_id)
-        send_to_topic(topic_id, f"\u2705 <code>{text[:200]}</code>")
+        react_to_message(msg_id, "\U0001F44D")  # Received
+        set_busy(session_name, msg_id)
+        react_to_message(msg_id, "\U0001F440")  # Busy
         logger.info(f"Injected into {zellij_session}: {prefixed_text}")
     else:
         send_to_topic(topic_id, f"\u274c Failed to send. Is the Zellij session alive?")
@@ -490,11 +473,15 @@ def process_callback_query(callback_query):
                 button_text = btn.get("text", action_value)
                 break
 
+    # Get the bot's message_id (the message with inline buttons)
+    cb_msg_id = callback_query.get("message", {}).get("message_id")
+
     if action_type == "perm":
         # Permission prompt: use Y/N keys or arrow navigation
         if inject_permission_into_zellij(zellij_session, action_value):
-            set_busy(session_name, topic_id)
-            send_typing_action(topic_id)
+            if cb_msg_id:
+                set_busy(session_name, cb_msg_id)
+                react_to_message(cb_msg_id, "\U0001F440")
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Selected: {button_text[:50]}"})
             send_to_topic(topic_id, f"\u2705 Selected: <code>{button_text[:100]}</code>")
             logger.info(f"Permission '{action_value}' injected into {zellij_session}")
@@ -512,8 +499,9 @@ def process_callback_query(callback_query):
         num_defined = int(parts[3]) if len(parts) >= 4 else 99
 
         if inject_selection_into_zellij(zellij_session, index, num_defined):
-            set_busy(session_name, topic_id)
-            send_typing_action(topic_id)
+            if cb_msg_id:
+                set_busy(session_name, cb_msg_id)
+                react_to_message(cb_msg_id, "\U0001F440")
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Selected: {button_text[:50]}"})
             send_to_topic(topic_id, f"\u2705 Selected: <code>{button_text[:100]}</code>")
             logger.info(f"Selection {index} injected into {zellij_session}: {button_text}")
@@ -534,11 +522,6 @@ def poll_loop():
     """Main polling loop using Telegram long-polling."""
     offset = None
     logger.info("Daemon started, entering poll loop")
-
-    # Start background typing indicator thread
-    typing_thread = threading.Thread(target=typing_indicator_loop, daemon=True)
-    typing_thread.start()
-    logger.info("Typing indicator thread started")
 
     while True:
         try:

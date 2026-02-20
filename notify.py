@@ -141,13 +141,27 @@ def extract_last_assistant_message(transcript_path):
     return ""
 
 
-def clear_busy(session_name):
-    """Clear busy marker — Claude has stopped processing."""
+def clear_busy(session_name, config):
+    """Clear busy marker and react with checkmark."""
     path = os.path.join(BUSY_DIR, session_name)
     try:
+        with open(path) as f:
+            message_id = int(f.read().strip())
         os.remove(path)
+        # React with ✅ to signal completion
+        url = f"https://api.telegram.org/bot{config['bot_token']}/setMessageReaction"
+        payload = {
+            "chat_id": config["group_chat_id"],
+            "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": "\U0001F3C6"}],
+        }
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
     except FileNotFoundError:
         pass
+    except Exception as e:
+        _logger.error(f"clear_busy error: {e}")
 
 
 def set_pending_permission(session_name):
@@ -312,8 +326,6 @@ def format_notification(hook_input, session_name):
     event = hook_input.get("hook_event_name", "")
 
     if event == "PermissionRequest":
-        # Claude paused for permission — clear busy indicator
-        clear_busy(session_name)
         set_pending_permission(session_name)
         return build_permission_message(hook_input, session_name)
 
@@ -330,8 +342,6 @@ def format_notification(hook_input, session_name):
         return None, None
 
     if event == "Notification":
-        # Claude is idle/waiting — clear busy indicator
-        clear_busy(session_name)
         notif_type = hook_input.get("notification_type", "")
         message = hook_input.get("message", "")
         title = hook_input.get("title", "")
@@ -341,6 +351,9 @@ def format_notification(hook_input, session_name):
             "idle_prompt": "\U0001F4A4",
             "elicitation_dialog": "\u2753",
             "auth_success": "\U0001F511",
+            "compact": "\U0001F4E6",
+            "context_compaction": "\U0001F4E6",
+            "compacting": "\U0001F4E6",
         }
         emoji = emoji_map.get(notif_type, "\U0001F514")
 
@@ -349,6 +362,9 @@ def format_notification(hook_input, session_name):
             "idle_prompt": "Idle / waiting for input",
             "elicitation_dialog": "Question for you",
             "auth_success": "Auth success",
+            "compact": "Compacting context",
+            "context_compaction": "Compacting context",
+            "compacting": "Compacting context",
         }
         label = label_map.get(notif_type, notif_type or "Notification")
 
@@ -362,8 +378,6 @@ def format_notification(hook_input, session_name):
         return text, None
 
     if event == "Stop":
-        # Claude stopped — clear busy indicator
-        clear_busy(session_name)
         stop_active = hook_input.get("stop_hook_active", False)
         transcript_path = hook_input.get("transcript_path", "")
 
@@ -404,6 +418,11 @@ def main():
         session_name = get_session_name()
         topic_id = get_topic_id(session_name)
         _logger.info(f"Session: {session_name}, topic_id: {topic_id}")
+
+        # Clear busy reaction on events that mean Claude paused/stopped
+        if event in ("Stop", "PermissionRequest", "Notification"):
+            clear_busy(session_name, config)
+
         text, reply_markup = format_notification(hook_input, session_name)
         _logger.info(f"Formatted text length: {len(text) if text else 0}")
         if text:
