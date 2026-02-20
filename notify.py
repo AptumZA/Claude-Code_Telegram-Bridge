@@ -30,9 +30,7 @@ def load_config():
 def get_session_name():
     """Derive session name from ZELLIJ_SESSION_NAME env var."""
     zellij_name = os.environ.get("ZELLIJ_SESSION_NAME", "")
-    if zellij_name.startswith("claude_"):
-        return zellij_name[7:]
-    elif zellij_name:
+    if zellij_name:
         return zellij_name
     return "unknown"
 

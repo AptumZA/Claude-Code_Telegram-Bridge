@@ -60,6 +60,15 @@ def load_sessions():
         return {}
 
 
+def save_sessions(sessions):
+    """Save sessions.json with file locking."""
+    with open(SESSIONS_FILE, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        json.dump(sessions, f, indent=2)
+        f.flush()
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def find_session_by_topic(topic_id):
     """Find session name and info by forum topic_id."""
     sessions = load_sessions()
@@ -195,31 +204,91 @@ def inject_permission_into_zellij(zellij_session, choice):
 
 
 def handle_sessions_command(topic_id=None):
-    """Handle /sessions command."""
-    sessions = load_sessions()
-    active = {n: i for n, i in sessions.items() if i.get("active", True)}
-    if not active:
-        send_to_topic(topic_id, "No active sessions.")
+    """Handle /tel_sessions command — list Zellij sessions."""
+    try:
+        result = subprocess.run(
+            ["zellij", "list-sessions", "--short"],
+            capture_output=True, text=True, timeout=5,
+        )
+        zellij_sessions = [s.strip() for s in result.stdout.strip().splitlines() if s.strip()]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        zellij_sessions = []
+
+    if not zellij_sessions:
+        send_to_topic(topic_id, "No Zellij sessions found.")
         return
 
-    lines = ["<b>Active Sessions:</b>"]
-    for name, info in active.items():
-        cwd = info.get("cwd", "?")
-        started = info.get("started_at", "?")
-        has_topic = "\u2705" if info.get("topic_id") else "\u274c"
-        lines.append(f"\n\u2022 <b>{name}</b> {has_topic}\n  <i>{cwd}</i>\n  Started: {started}")
+    # Load bridge sessions for extra info
+    bridge_sessions = load_sessions()
+
+    lines = ["<b>Zellij Sessions:</b>"]
+    for zs in zellij_sessions:
+        info = bridge_sessions.get(zs, {})
+        active = info.get("active", False)
+        has_topic = "\u2705" if info.get("topic_id") else "\u2796"
+        cwd = info.get("cwd", "")
+        status = "\U0001F7E2" if active else "\u26aa"
+        line = f"\n{status} <b>{zs}</b> {has_topic}"
+        if cwd:
+            line += f"\n  <i>{cwd}</i>"
+        lines.append(line)
+
+    lines.append(f"\n\U0001F7E2 = bridge active, \u26aa = no bridge")
+    lines.append(f"\u2705 = has topic, \u2796 = no topic")
     send_to_topic(topic_id, "\n".join(lines))
 
 
+def handle_rename_command(topic_id, args_text):
+    """Handle /tel_rename command — rename a Zellij session."""
+    new_name = args_text.strip()
+    if not new_name:
+        send_to_topic(topic_id, "\u26a0\ufe0f Usage: <code>/tel_rename new_name</code>")
+        return
+
+    session_name, session_info = find_session_by_topic(topic_id)
+    if not session_name:
+        send_to_topic(topic_id, "\u26a0\ufe0f No session linked to this topic.")
+        return
+
+    zellij_session = session_info.get("zellij_session", "")
+    if not zellij_session:
+        send_to_topic(topic_id, "\u26a0\ufe0f Session has no Zellij session.")
+        return
+
+    # Zellij doesn't have a native rename command — update the bridge mapping
+    # and rename the Telegram topic
+    sessions = load_sessions()
+
+    # Update sessions.json: move entry to new name
+    old_info = sessions.pop(session_name, {})
+    old_info["zellij_session"] = zellij_session  # Zellij session name stays the same
+    sessions[new_name] = old_info
+    save_sessions(sessions)
+
+    # Rename the Telegram forum topic
+    try:
+        telegram_api("editForumTopic", {
+            "chat_id": GROUP_CHAT_ID,
+            "message_thread_id": topic_id,
+            "name": new_name,
+        })
+    except Exception as e:
+        logger.error(f"Failed to rename topic: {e}")
+
+    send_to_topic(topic_id, f"\u2705 Renamed: <b>{session_name}</b> \u2192 <b>{new_name}</b>")
+    logger.info(f"Renamed session {session_name} -> {new_name}")
+
+
 def handle_help_command(topic_id=None):
-    """Handle /help command."""
+    """Handle /tel_help command."""
     send_to_topic(topic_id,
         "<b>Telegram-Claude Bridge</b>\n\n"
         "<b>Forum Topics Mode:</b>\n"
         "Each session has its own topic. Just type your reply in the topic \u2014 no prefix needed.\n\n"
-        "<b>Bridge Commands:</b>\n"
-        "/sessions - List active sessions\n"
-        "/help - Show this help\n\n"
+        "<b>Bridge Commands (tel_):</b>\n"
+        "/tel_sessions - List Zellij sessions\n"
+        "/tel_rename &lt;name&gt; - Rename session/topic\n"
+        "/tel_help - Show this help\n\n"
         "<b>Claude Code Commands:</b>\n"
         "All other /<i>command</i> entries in the menu are forwarded to the Claude Code session "
         "linked to this topic (e.g. /compact, /init, /model)."
@@ -259,11 +328,14 @@ def process_message(message):
 
     logger.info(f"Received in topic {topic_id}: {text}")
 
-    # Handle bridge commands
-    if text.startswith("/sessions"):
+    # Handle bridge commands (tel_ prefixed)
+    if text.startswith("/tel_sessions"):
         handle_sessions_command(topic_id)
         return
-    if text.startswith("/help") or text.startswith("/start"):
+    if text.startswith("/tel_rename"):
+        handle_rename_command(topic_id, text[len("/tel_rename"):])
+        return
+    if text.startswith("/tel_help") or text.startswith("/start"):
         handle_help_command(topic_id)
         return
 
