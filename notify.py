@@ -13,13 +13,24 @@ import sys
 import fcntl
 import urllib.request
 import urllib.error
+import logging
+from logging.handlers import RotatingFileHandler
 
 import time
+
+# Logging for debugging
+BRIDGE_DIR_LOG = os.path.dirname(os.path.abspath(__file__))
+_logger = logging.getLogger("notify")
+_logger.setLevel(logging.DEBUG)
+_log_handler = RotatingFileHandler(os.path.join(BRIDGE_DIR_LOG, "notify.log"), maxBytes=500_000, backupCount=2)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+_logger.addHandler(_log_handler)
 
 BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BRIDGE_DIR, "config.json")
 SESSIONS_FILE = os.path.join(BRIDGE_DIR, "sessions.json")
 PENDING_DIR = os.path.join(BRIDGE_DIR, "pending")
+BUSY_DIR = os.path.join(BRIDGE_DIR, "busy")
 
 
 def load_config():
@@ -74,6 +85,69 @@ def send_telegram(config, text, reply_markup=None, topic_id=None):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10)
+
+
+def extract_last_assistant_message(transcript_path):
+    """Extract the last assistant text message from a JSONL transcript file.
+
+    Reads the file backwards (last 50 lines) to find the most recent
+    assistant message with text content.
+    """
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return ""
+
+    try:
+        # Read last portion of file to find recent assistant messages
+        with open(transcript_path, "rb") as f:
+            # Seek to end, read last ~100KB
+            f.seek(0, 2)
+            size = f.tell()
+            read_size = min(size, 100_000)
+            f.seek(size - read_size)
+            tail = f.read().decode("utf-8", errors="replace")
+
+        lines = tail.strip().splitlines()
+        # Search backwards for the last assistant message with text
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # Direct assistant message
+            msg = None
+            if entry.get("type") == "assistant":
+                msg = entry.get("message", {})
+            elif entry.get("type") == "progress":
+                inner = entry.get("data", {}).get("message", {})
+                if inner.get("type") == "assistant":
+                    msg = inner.get("message", {})
+
+            if not msg:
+                continue
+
+            content = msg.get("content", [])
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+
+            if text_parts:
+                return "\n".join(text_parts)
+
+    except Exception as e:
+        _logger.error(f"Failed to read transcript: {e}")
+
+    return ""
+
+
+def clear_busy(session_name):
+    """Clear busy marker — Claude has stopped processing."""
+    path = os.path.join(BUSY_DIR, session_name)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def set_pending_permission(session_name):
@@ -238,7 +312,8 @@ def format_notification(hook_input, session_name):
     event = hook_input.get("hook_event_name", "")
 
     if event == "PermissionRequest":
-        # Mark that a permission prompt is pending for this session
+        # Claude paused for permission — clear busy indicator
+        clear_busy(session_name)
         set_pending_permission(session_name)
         return build_permission_message(hook_input, session_name)
 
@@ -255,6 +330,8 @@ def format_notification(hook_input, session_name):
         return None, None
 
     if event == "Notification":
+        # Claude is idle/waiting — clear busy indicator
+        clear_busy(session_name)
         notif_type = hook_input.get("notification_type", "")
         message = hook_input.get("message", "")
         title = hook_input.get("title", "")
@@ -285,8 +362,13 @@ def format_notification(hook_input, session_name):
         return text, None
 
     if event == "Stop":
+        # Claude stopped — clear busy indicator
+        clear_busy(session_name)
         stop_active = hook_input.get("stop_hook_active", False)
-        last_msg = hook_input.get("last_assistant_message", "")
+        transcript_path = hook_input.get("transcript_path", "")
+
+        # Extract last assistant message from transcript
+        last_msg = extract_last_assistant_message(transcript_path)
 
         header = f"\U0001F6D1 <b>Stopped</b>"
         if stop_active:
@@ -294,7 +376,7 @@ def format_notification(hook_input, session_name):
 
         if last_msg:
             escaped = html_escape(last_msg)
-            max_body = 4000 - len(header)
+            max_body = 4000 - len(header) - 20  # margin for tags
             if len(escaped) > max_body:
                 escaped = escaped[:max_body - 3] + "..."
             header += f"\n<i>{escaped}</i>"
@@ -311,13 +393,24 @@ def main():
         hook_input = {}
 
     try:
+        event = hook_input.get("hook_event_name", "")
+        _logger.info(f"Event: {event}, keys: {list(hook_input.keys())}")
+        if event == "Stop":
+            _logger.info(f"Stop data: stop_hook_active={hook_input.get('stop_hook_active')}, "
+                         f"last_assistant_message length={len(hook_input.get('last_assistant_message', ''))}, "
+                         f"last_assistant_message preview={repr(hook_input.get('last_assistant_message', '')[:200])}")
+
         config = load_config()
         session_name = get_session_name()
         topic_id = get_topic_id(session_name)
+        _logger.info(f"Session: {session_name}, topic_id: {topic_id}")
         text, reply_markup = format_notification(hook_input, session_name)
+        _logger.info(f"Formatted text length: {len(text) if text else 0}")
         if text:
             send_telegram(config, text, reply_markup, topic_id)
-    except Exception:
+            _logger.info("Sent to Telegram")
+    except Exception as e:
+        _logger.error(f"Error: {e}", exc_info=True)
         pass  # Fire-and-forget: never fail the hook
 
     # Output empty JSON
