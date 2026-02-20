@@ -115,6 +115,9 @@ def telegram_api(method, params=None):
     return json.loads(resp.read().decode())
 
 
+GENERAL_TOPIC_ID = 1
+
+
 def send_to_topic(topic_id, text, parse_mode="HTML"):
     """Send a message to a specific forum topic."""
     try:
@@ -123,7 +126,8 @@ def send_to_topic(topic_id, text, parse_mode="HTML"):
             "text": text,
             "parse_mode": parse_mode,
         }
-        if topic_id:
+        # General topic (id=1) doesn't accept message_thread_id
+        if topic_id and topic_id != GENERAL_TOPIC_ID:
             params["message_thread_id"] = topic_id
         telegram_api("sendMessage", params)
     except Exception as e:
@@ -240,6 +244,9 @@ def list_claude_sessions(cwd):
 def start_tmux_with_claude(tmux_name, cwd, claude_args=""):
     """Start a new tmux session running Claude Code.
 
+    Creates a bare tmux session first, then sends the claude command via
+    send-keys. This ensures the session survives even if claude fails to start.
+
     Args:
         tmux_name: tmux session name
         cwd: working directory for the session
@@ -247,12 +254,26 @@ def start_tmux_with_claude(tmux_name, cwd, claude_args=""):
     """
     cmd = f"claude {claude_args}".strip()
     try:
+        # Create bare tmux session with bash shell
+        # Use -e to set a clean environment without CLAUDECODE
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", tmux_name, "-c", cwd, cmd],
-            timeout=10, capture_output=True,
+            ["tmux", "new-session", "-d", "-s", tmux_name, "-c", cwd],
+            timeout=10, capture_output=True, env=env,
         )
-        # Give Claude a moment to start
-        time.sleep(1)
+        # Unset CLAUDECODE inside the tmux session before starting claude
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_name, "unset CLAUDECODE", "Enter"],
+            timeout=5, capture_output=True,
+        )
+        time.sleep(0.3)
+        # Send the claude command
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_name, cmd, "Enter"],
+            timeout=5, capture_output=True,
+        )
+        time.sleep(2)
         return is_session_alive(tmux_name)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.error(f"Failed to start tmux session {tmux_name}: {e}")
@@ -362,11 +383,9 @@ def handle_sessions_command(topic_id=None):
     send_to_topic(topic_id, "\n".join(lines))
 
 
-def get_topic_display_name(session_name, backend):
-    """Get the topic display name with backend prefix."""
-    prefix_map = {"tmux": "tmux_", "zellij": "zell_"}
-    prefix = prefix_map.get(backend, "")
-    return f"{prefix}{session_name}"
+def get_topic_display_name(session_name):
+    """Get the topic display name with tmux_ prefix."""
+    return f"tmux_{session_name}"
 
 
 def handle_rename_command(topic_id, args_text):
@@ -381,7 +400,7 @@ def handle_rename_command(topic_id, args_text):
         send_to_topic(topic_id, "\u26a0\ufe0f No session linked to this topic.")
         return
 
-    tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
+    tmux_session = session_info.get("tmux_session", "")
     if not tmux_session:
         send_to_topic(topic_id, "\u26a0\ufe0f Session has no terminal session.")
         return
@@ -395,9 +414,8 @@ def handle_rename_command(topic_id, args_text):
     sessions[new_name] = old_info
     save_sessions(sessions)
 
-    # Rename the Telegram forum topic with backend prefix
-    backend = old_info.get("backend", "tmux")
-    topic_display = get_topic_display_name(new_name, backend)
+    # Rename the Telegram forum topic with tmux_ prefix
+    topic_display = get_topic_display_name(new_name)
     try:
         telegram_api("editForumTopic", {
             "chat_id": GROUP_CHAT_ID,
@@ -420,6 +438,12 @@ def handle_session_start(topic_id):
 
     tmux_name = session_info.get("tmux_session") or session_name
     if is_session_alive(tmux_name):
+        # Ensure it's marked active
+        if not session_info.get("active"):
+            sessions = load_sessions()
+            if session_name in sessions:
+                sessions[session_name]["active"] = True
+                save_sessions(sessions)
         send_to_topic(topic_id, f"\u2705 <b>{tmux_name}</b> is already running.")
         return
 
@@ -462,13 +486,15 @@ def handle_session_start(topic_id):
     ])
 
     try:
-        telegram_api("sendMessage", {
+        picker_params = {
             "chat_id": GROUP_CHAT_ID,
-            "message_thread_id": topic_id,
             "text": f"\U0001F4C2 <b>{tmux_name}</b>\n<i>{cwd}</i>\n\nSelect a Claude session to resume:",
             "parse_mode": "HTML",
             "reply_markup": {"inline_keyboard": buttons},
-        })
+        }
+        if topic_id and topic_id != GENERAL_TOPIC_ID:
+            picker_params["message_thread_id"] = topic_id
+        telegram_api("sendMessage", picker_params)
     except Exception as e:
         logger.error(f"Failed to send session picker: {e}")
         # Fallback: just start with continue
@@ -548,6 +574,10 @@ def process_message(message):
     text = message.get("text", "")
     topic_id = message.get("message_thread_id")
 
+    # General topic in forum groups has no message_thread_id — treat as topic 1
+    if topic_id is None:
+        topic_id = 1
+
     if not text:
         return
 
@@ -585,7 +615,7 @@ def process_message(message):
         send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> is not active.")
         return
 
-    tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
+    tmux_session = session_info.get("tmux_session", "")
     if not tmux_session:
         send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> has no tmux session.")
         return
@@ -652,7 +682,7 @@ def process_callback_query(callback_query):
         return
 
     session_info = sessions[session_name]
-    tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
+    tmux_session = session_info.get("tmux_session", "")
     topic_id = session_info.get("topic_id")
 
     if not tmux_session:
@@ -745,6 +775,11 @@ def process_callback_query(callback_query):
         telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"{label}..."})
 
         if start_tmux_with_claude(tmux_session, cwd, claude_args):
+            # Mark session as active
+            sessions_data = load_sessions()
+            if session_name in sessions_data:
+                sessions_data[session_name]["active"] = True
+                save_sessions(sessions_data)
             send_to_topic(topic_id, f"\u2705 Started <b>{tmux_session}</b>\n{label}")
             logger.info(f"Started tmux {tmux_session} in {cwd} with: claude {claude_args}")
         else:
