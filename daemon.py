@@ -150,14 +150,20 @@ def zellij_write_bytes(env, *byte_args):
 
 
 def is_zellij_session_alive(zellij_session):
-    """Check if a Zellij session exists and is running."""
+    """Check if a Zellij session has an attached terminal.
+
+    Detached sessions have a server but Claude Code gets suspended (SIGTSTP).
+    Only sessions with an 'attach' process have an active Claude Code.
+    """
     try:
         result = subprocess.run(
-            ["zellij", "list-sessions", "--short"],
+            ["pgrep", "-af", "zellij"],
             capture_output=True, text=True, timeout=5,
         )
-        sessions = [s.strip() for s in result.stdout.strip().splitlines()]
-        return zellij_session in sessions
+        for line in result.stdout.splitlines():
+            if f"attach {zellij_session}" in line:
+                return True
+        return False
     except Exception:
         return False
 
@@ -397,7 +403,7 @@ def process_message(message):
         return
 
     if not is_zellij_session_alive(zellij_session):
-        send_to_topic(topic_id, f"\u26a0\ufe0f Zellij session <b>{zellij_session}</b> is not running. Open a terminal with this session first.")
+        send_to_topic(topic_id, f"\u26a0\ufe0f <b>{zellij_session}</b> has no open terminal. Claude is suspended.\nAttach with: <code>zellij attach {zellij_session}</code>")
         return
 
     msg_id = message.get("message_id")
