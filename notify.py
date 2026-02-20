@@ -14,9 +14,12 @@ import fcntl
 import urllib.request
 import urllib.error
 
+import time
+
 BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BRIDGE_DIR, "config.json")
 SESSIONS_FILE = os.path.join(BRIDGE_DIR, "sessions.json")
+PENDING_DIR = os.path.join(BRIDGE_DIR, "pending")
 
 
 def load_config():
@@ -73,6 +76,27 @@ def send_telegram(config, text, reply_markup=None, topic_id=None):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10)
+
+
+def set_pending_permission(session_name):
+    """Mark that a permission prompt is active for this session."""
+    os.makedirs(PENDING_DIR, exist_ok=True)
+    path = os.path.join(PENDING_DIR, session_name)
+    with open(path, "w") as f:
+        f.write(str(time.time()))
+
+
+def consume_pending_permission(session_name):
+    """Check and clear pending permission marker. Returns True if one existed."""
+    path = os.path.join(PENDING_DIR, session_name)
+    try:
+        with open(path) as f:
+            ts = float(f.read().strip())
+        os.remove(path)
+        # Only valid if less than 5 minutes old
+        return (time.time() - ts) < 300
+    except (FileNotFoundError, ValueError):
+        return False
 
 
 def build_ask_question_message(hook_input, session_name):
@@ -172,12 +196,65 @@ def build_permission_message(hook_input, session_name):
     return "\n".join(lines), keyboard
 
 
+def format_post_tool(hook_input, session_name):
+    """Format PostToolUse confirmation — tool ran successfully (permission granted)."""
+    tool_name = hook_input.get("tool_name", "unknown")
+    tool_input = hook_input.get("tool_input", {})
+
+    if tool_name == "AskUserQuestion":
+        return None, None  # Don't double-notify for questions
+
+    summary = f"\u2705 <b>Allowed</b>: {html_escape(tool_name)}"
+
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        desc = tool_input.get("description", "")
+        if desc:
+            summary += f"\n<i>{html_escape(desc)}</i>"
+        elif cmd:
+            cmd_short = cmd if len(cmd) <= 100 else cmd[:97] + "..."
+            summary += f"\n<code>{html_escape(cmd_short)}</code>"
+    elif tool_name in ("Write", "Edit"):
+        fp = tool_input.get("file_path", "")
+        if fp:
+            summary += f"\n<code>{html_escape(fp)}</code>"
+
+    return summary, None
+
+
+def format_post_tool_failure(hook_input, session_name):
+    """Format PostToolUseFailure — tool was denied or failed."""
+    tool_name = hook_input.get("tool_name", "unknown")
+    error = hook_input.get("error", "")
+
+    summary = f"\u274c <b>Denied/Failed</b>: {html_escape(tool_name)}"
+    if error:
+        error_short = error if len(error) <= 200 else error[:197] + "..."
+        summary += f"\n<i>{html_escape(error_short)}</i>"
+
+    return summary, None
+
+
 def format_notification(hook_input, session_name):
     """Format a notification message. Returns (text, reply_markup) tuple."""
     event = hook_input.get("hook_event_name", "")
 
     if event == "PermissionRequest":
+        # Mark that a permission prompt is pending for this session
+        set_pending_permission(session_name)
         return build_permission_message(hook_input, session_name)
+
+    if event == "PostToolUse":
+        # Only notify if there was a recent permission prompt (not auto-allowed)
+        if consume_pending_permission(session_name):
+            return format_post_tool(hook_input, session_name)
+        return None, None
+
+    if event == "PostToolUseFailure":
+        # Always notify on failure if there was a pending permission
+        if consume_pending_permission(session_name):
+            return format_post_tool_failure(hook_input, session_name)
+        return None, None
 
     if event == "Notification":
         notif_type = hook_input.get("notification_type", "")

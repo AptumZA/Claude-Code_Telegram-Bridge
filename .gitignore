@@ -4,3 +4,4 @@ sessions.json
 *.log
 *.log.*
 __pycache__/
+pending/
