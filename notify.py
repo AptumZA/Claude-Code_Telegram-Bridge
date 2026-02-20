@@ -156,15 +156,15 @@ def build_permission_message(hook_input, session_name):
             details = details[:297] + "..."
         lines.append(f"<code>{html_escape(details)}</code>")
 
-    # Terminal order: 1=Yes, 2=Always Allow, 3=No
+    # Permission buttons using named actions (Y key, N key, arrow+enter)
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "\u2705 Yes", "callback_data": f"{session_name}|perm|0"},
-                {"text": "\U0001F513 Always allow", "callback_data": f"{session_name}|perm|1"},
+                {"text": "\u2705 Yes", "callback_data": f"{session_name}|perm|yes"},
+                {"text": "\U0001F513 Always allow", "callback_data": f"{session_name}|perm|always"},
             ],
             [
-                {"text": "\u274c No", "callback_data": f"{session_name}|perm|2"},
+                {"text": "\u274c No", "callback_data": f"{session_name}|perm|no"},
             ],
         ]
     }

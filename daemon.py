@@ -134,11 +134,15 @@ def inject_into_zellij(zellij_session, text):
 
 
 def inject_selection_into_zellij(zellij_session, index, num_defined_options=4):
-    """Select an option by number key (1-4) or arrow navigation (5+).
+    """Select an option in AskUserQuestion UI.
 
-    Claude Code's AskUserQuestion shows defined options (1-N) which respond
-    to number keys, plus built-in options (Other, Chat) which only respond
-    to arrow key navigation.
+    Claude Code's Select context accepts:
+    - Number keys (1-9) to jump to defined options
+    - Arrow Down/Up (or J/K) to navigate
+    - Enter to confirm
+
+    Defined options (index < num_defined_options) use number keys.
+    Built-in options (Other, Chat) use arrow navigation.
     """
     env = os.environ.copy()
     env["ZELLIJ_SESSION_NAME"] = zellij_session
@@ -162,6 +166,31 @@ def inject_selection_into_zellij(zellij_session, index, num_defined_options=4):
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.error(f"Zellij selection failed for {zellij_session}: {e}")
+        return False
+
+
+def inject_permission_into_zellij(zellij_session, choice):
+    """Handle permission prompt selection using number keys.
+
+    Permission prompt order is always: 1=Yes, 2=Always Allow, 3=No
+    Uses same number key approach as AskUserQuestion (proven to work).
+    """
+    env = os.environ.copy()
+    env["ZELLIJ_SESSION_NAME"] = zellij_session
+
+    perm_map = {"yes": "1", "always": "2", "no": "3"}
+    number = perm_map.get(choice)
+    if not number:
+        return False
+
+    try:
+        subprocess.run(
+            ["zellij", "action", "write-chars", number],
+            env=env, timeout=5, capture_output=True,
+        )
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logger.error(f"Zellij permission failed for {zellij_session}: {e}")
         return False
 
 
@@ -299,17 +328,24 @@ def process_callback_query(callback_query):
                 button_text = btn.get("text", action_value)
                 break
 
-    if action_type in ("opt", "perm"):
+    if action_type == "perm":
+        # Permission prompt: use Y/N keys or arrow navigation
+        if inject_permission_into_zellij(zellij_session, action_value):
+            telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Selected: {button_text[:50]}"})
+            send_to_topic(topic_id, f"\u2705 Selected: <code>{button_text[:100]}</code>")
+            logger.info(f"Permission '{action_value}' injected into {zellij_session}")
+        else:
+            telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Failed to send"})
+            send_to_topic(topic_id, f"\u274c Failed to send.")
+    elif action_type == "opt":
+        # AskUserQuestion: number keys for defined options, arrows for built-in
         try:
             index = int(action_value)
         except ValueError:
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Invalid index"})
             return
 
-        # For opt: parts[3] is num_defined_options; for perm: always use numbers
         num_defined = int(parts[3]) if len(parts) >= 4 else 99
-        if action_type == "perm":
-            num_defined = 99  # permissions always use number keys
 
         if inject_selection_into_zellij(zellij_session, index, num_defined):
             telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Selected: {button_text[:50]}"})
