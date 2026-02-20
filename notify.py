@@ -39,9 +39,9 @@ def load_config():
         return json.load(f)
 
 
-def get_session_name():
-    """Derive session name from tmux or Zellij env vars."""
-    # Only use tmux if we're actually inside a tmux session
+def get_session_name(hook_input):
+    """Derive session name from tmux env var, or fall back to session_id/cwd lookup."""
+    # Direct tmux detection
     if os.environ.get("TMUX"):
         try:
             result = subprocess.run(
@@ -52,10 +52,21 @@ def get_session_name():
                 return result.stdout.strip()
         except Exception:
             pass
-    # Fallback to Zellij
-    zellij_name = os.environ.get("ZELLIJ_SESSION_NAME", "")
-    if zellij_name:
-        return zellij_name
+
+    # Fallback: look up existing entry by session_id or cwd
+    session_id = hook_input.get("session_id", "")
+    cwd = hook_input.get("cwd", "")
+    sessions = load_sessions()
+
+    if session_id:
+        for name, info in sessions.items():
+            if info.get("session_id") == session_id:
+                return name
+    if cwd:
+        for name, info in sessions.items():
+            if info.get("cwd") == cwd and info.get("active"):
+                return name
+
     return "unknown"
 
 
@@ -91,7 +102,8 @@ def send_telegram(config, text, reply_markup=None, topic_id=None):
         "text": text,
         "parse_mode": "HTML",
     }
-    if topic_id:
+    # General topic (id=1) doesn't accept message_thread_id
+    if topic_id and topic_id != 1:
         payload["message_thread_id"] = topic_id
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -428,7 +440,7 @@ def main():
                          f"last_assistant_message preview={repr(hook_input.get('last_assistant_message', '')[:200])}")
 
         config = load_config()
-        session_name = get_session_name()
+        session_name = get_session_name(hook_input)
         topic_id = get_topic_id(session_name)
         _logger.info(f"Session: {session_name}, topic_id: {topic_id}")
 
