@@ -1,0 +1,6 @@
+config.json
+sessions.json
+*.pid
+*.log
+*.log.*
+__pycache__/
