@@ -95,6 +95,22 @@ def get_session_name():
     return None
 
 
+def get_backend():
+    """Detect which terminal multiplexer backend is active."""
+    if os.environ.get("TMUX"):
+        return "tmux"
+    if os.environ.get("ZELLIJ_SESSION_NAME"):
+        return "zellij"
+    return "unknown"
+
+
+def get_topic_display_name(session_name, backend):
+    """Get the topic display name with backend prefix."""
+    prefix_map = {"tmux": "tmux_", "zellij": "zell_"}
+    prefix = prefix_map.get(backend, "")
+    return f"{prefix}{session_name}"
+
+
 def load_sessions():
     """Load sessions.json with file locking."""
     try:
@@ -148,6 +164,7 @@ def main():
     session_id = hook_input.get("session_id", "unknown")
     cwd = hook_input.get("cwd", "")
     session_name = get_session_name()
+    backend = get_backend()
     tmux_session = session_name or ""
 
     if not session_name:
@@ -158,17 +175,27 @@ def main():
     if event == "SessionStart":
         # Check if this session already has a topic (e.g. from a previous run)
         topic_id = None
+        topic_display = get_topic_display_name(session_name, backend)
         if session_name in sessions and sessions[session_name].get("topic_id"):
             topic_id = sessions[session_name]["topic_id"]
             # Reopen it in case it was closed
             reopen_forum_topic(config, topic_id)
+            # Update topic name with correct prefix if backend changed
+            old_backend = sessions[session_name].get("backend", "")
+            if old_backend != backend:
+                telegram_api(config, "editForumTopic", {
+                    "chat_id": config["group_chat_id"],
+                    "message_thread_id": topic_id,
+                    "name": topic_display,
+                })
         else:
-            # Create a new forum topic
-            topic_id = create_forum_topic(config, session_name)
+            # Create a new forum topic with backend prefix
+            topic_id = create_forum_topic(config, topic_display)
 
         sessions[session_name] = {
             "session_id": session_id,
             "tmux_session": tmux_session,
+            "backend": backend,
             "cwd": cwd,
             "topic_id": topic_id,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),

@@ -16,6 +16,7 @@ import os
 import sys
 import signal
 import time
+import glob
 import subprocess
 import urllib.request
 import urllib.error
@@ -153,11 +154,121 @@ def is_session_alive(session_name):
         return False
 
 
+def cwd_to_project_dir(cwd):
+    """Convert a working directory to Claude's project session directory path.
+
+    Claude encodes paths by replacing / and _ with -, e.g.:
+    /home/admin1/aptum/white_labeling -> -home-admin1-aptum-white-labeling
+    """
+    encoded = cwd.replace("/", "-").replace("_", "-")
+    return os.path.expanduser(f"~/.claude/projects/{encoded}")
+
+
+def list_claude_sessions(cwd):
+    """List available Claude Code sessions for a given working directory.
+
+    Returns list of dicts: {id, name, first_msg, mtime, age}
+    """
+    project_dir = cwd_to_project_dir(cwd)
+    sessions = []
+    now = time.time()
+    for f in glob.glob(os.path.join(project_dir, "*.jsonl")):
+        sid = os.path.basename(f).replace(".jsonl", "")
+        mtime = os.path.getmtime(f)
+        name = None
+        first_msg = None
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("type") == "custom-title":
+                            name = entry.get("customTitle", "")
+                        if first_msg is None and entry.get("type") == "user":
+                            # Skip tool result messages
+                            if entry.get("toolUseResult"):
+                                continue
+                            msg = entry.get("message", {})
+                            content = msg.get("content", []) if isinstance(msg, dict) else []
+                            if isinstance(content, str):
+                                text = content.strip()
+                                if text and not text.startswith("[Request"):
+                                    first_msg = text[:60]
+                            elif isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "text":
+                                        text = c["text"].strip()
+                                        if text and not text.startswith("[Request"):
+                                            first_msg = text[:60]
+                                            break
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except OSError:
+            pass
+        # Human-readable age
+        age_secs = now - mtime
+        if age_secs < 3600:
+            age = f"{int(age_secs / 60)}m"
+        elif age_secs < 86400:
+            age = f"{int(age_secs / 3600)}h"
+        else:
+            age = f"{int(age_secs / 86400)}d"
+        # File size
+        try:
+            size_bytes = os.path.getsize(f)
+            if size_bytes < 1024:
+                size = f"{size_bytes}B"
+            elif size_bytes < 1024 * 1024:
+                size = f"{size_bytes // 1024}KB"
+            else:
+                size = f"{size_bytes // (1024 * 1024)}MB"
+        except OSError:
+            size = "?"
+        sessions.append({
+            "id": sid,
+            "name": name,
+            "first_msg": first_msg,
+            "mtime": mtime,
+            "age": age,
+            "size": size,
+        })
+    # Sort by most recently modified first
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def start_tmux_with_claude(tmux_name, cwd, claude_args=""):
+    """Start a new tmux session running Claude Code.
+
+    Args:
+        tmux_name: tmux session name
+        cwd: working directory for the session
+        claude_args: extra args for claude command (e.g. '--resume name')
+    """
+    cmd = f"claude {claude_args}".strip()
+    try:
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", tmux_name, "-c", cwd, cmd],
+            timeout=10, capture_output=True,
+        )
+        # Give Claude a moment to start
+        time.sleep(1)
+        return is_session_alive(tmux_name)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logger.error(f"Failed to start tmux session {tmux_name}: {e}")
+        return False
+
+
 def inject_into_session(session_name, text):
     """Inject text into a tmux session via send-keys + Enter."""
     try:
         subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, text, "Enter"],
+            ["tmux", "send-keys", "-t", session_name, text],
+            timeout=5, capture_output=True,
+        )
+        time.sleep(0.1)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
             timeout=5, capture_output=True,
         )
         return True
@@ -251,8 +362,15 @@ def handle_sessions_command(topic_id=None):
     send_to_topic(topic_id, "\n".join(lines))
 
 
+def get_topic_display_name(session_name, backend):
+    """Get the topic display name with backend prefix."""
+    prefix_map = {"tmux": "tmux_", "zellij": "zell_"}
+    prefix = prefix_map.get(backend, "")
+    return f"{prefix}{session_name}"
+
+
 def handle_rename_command(topic_id, args_text):
-    """Handle /tel_rename command — rename a Zellij session."""
+    """Handle /tel_rename command — rename a session."""
     new_name = args_text.strip()
     if not new_name:
         send_to_topic(topic_id, "\u26a0\ufe0f Usage: <code>/tel_rename new_name</code>")
@@ -265,7 +383,7 @@ def handle_rename_command(topic_id, args_text):
 
     tmux_session = session_info.get("tmux_session") or session_info.get("zellij_session", "")
     if not tmux_session:
-        send_to_topic(topic_id, "\u26a0\ufe0f Session has no tmux session.")
+        send_to_topic(topic_id, "\u26a0\ufe0f Session has no terminal session.")
         return
 
     # Update the bridge mapping and rename the Telegram topic
@@ -277,18 +395,111 @@ def handle_rename_command(topic_id, args_text):
     sessions[new_name] = old_info
     save_sessions(sessions)
 
-    # Rename the Telegram forum topic
+    # Rename the Telegram forum topic with backend prefix
+    backend = old_info.get("backend", "tmux")
+    topic_display = get_topic_display_name(new_name, backend)
     try:
         telegram_api("editForumTopic", {
             "chat_id": GROUP_CHAT_ID,
             "message_thread_id": topic_id,
-            "name": new_name,
+            "name": topic_display,
         })
     except Exception as e:
         logger.error(f"Failed to rename topic: {e}")
 
     send_to_topic(topic_id, f"\u2705 Renamed: <b>{session_name}</b> \u2192 <b>{new_name}</b>")
     logger.info(f"Renamed session {session_name} -> {new_name}")
+
+
+def handle_session_start(topic_id):
+    """Handle /tel_session_start — start tmux session and offer Claude sessions to resume."""
+    session_name, session_info = find_session_by_topic(topic_id)
+    if not session_name:
+        send_to_topic(topic_id, "\u26a0\ufe0f No session linked to this topic.")
+        return
+
+    tmux_name = session_info.get("tmux_session") or session_name
+    if is_session_alive(tmux_name):
+        send_to_topic(topic_id, f"\u2705 <b>{tmux_name}</b> is already running.")
+        return
+
+    cwd = session_info.get("cwd", os.path.expanduser("~"))
+    if not cwd or not os.path.isdir(cwd):
+        cwd = os.path.expanduser("~")
+
+    # List available Claude sessions for this directory
+    claude_sessions = list_claude_sessions(cwd)
+
+    if not claude_sessions:
+        # No existing sessions — just start fresh
+        if start_tmux_with_claude(tmux_name, cwd):
+            send_to_topic(topic_id, f"\u2705 Started <b>{tmux_name}</b> with new Claude session\n<i>{cwd}</i>")
+        else:
+            send_to_topic(topic_id, f"\u274c Failed to start <b>{tmux_name}</b>")
+        return
+
+    # Build inline keyboard with session choices
+    buttons = []
+    for i, cs in enumerate(claude_sessions[:8]):  # max 8 sessions
+        # Prefer name, fall back to first message, then truncated ID
+        if cs["name"]:
+            label = cs["name"]
+        elif cs["first_msg"]:
+            label = cs["first_msg"]
+        else:
+            label = cs["id"][:8]
+        # Truncate and add age
+        if len(label) > 25:
+            label = label[:22] + "..."
+        label = f"{label} ({cs['age']}, {cs['size']})"
+        cb_data = f"{session_name}|start|resume|{cs['id']}"
+        buttons.append([{"text": f"\U0001F504 {label}", "callback_data": cb_data}])
+
+    # Add "New session" and "Delete sessions" options
+    buttons.append([
+        {"text": "\u2795 New session", "callback_data": f"{session_name}|start|new|_"},
+        {"text": "\U0001F5D1 Delete", "callback_data": f"{session_name}|start|delete_menu|_"},
+    ])
+
+    try:
+        telegram_api("sendMessage", {
+            "chat_id": GROUP_CHAT_ID,
+            "message_thread_id": topic_id,
+            "text": f"\U0001F4C2 <b>{tmux_name}</b>\n<i>{cwd}</i>\n\nSelect a Claude session to resume:",
+            "parse_mode": "HTML",
+            "reply_markup": {"inline_keyboard": buttons},
+        })
+    except Exception as e:
+        logger.error(f"Failed to send session picker: {e}")
+        # Fallback: just start with continue
+        if start_tmux_with_claude(tmux_name, cwd, "-c"):
+            send_to_topic(topic_id, f"\u2705 Started <b>{tmux_name}</b> (continued last session)")
+        else:
+            send_to_topic(topic_id, f"\u274c Failed to start <b>{tmux_name}</b>")
+
+
+def handle_session_end(topic_id):
+    """Handle /tel_session_end — kill the tmux session."""
+    session_name, session_info = find_session_by_topic(topic_id)
+    if not session_name:
+        send_to_topic(topic_id, "\u26a0\ufe0f No session linked to this topic.")
+        return
+
+    tmux_name = session_info.get("tmux_session") or session_name
+    if not is_session_alive(tmux_name):
+        send_to_topic(topic_id, f"\u26aa <b>{tmux_name}</b> is not running.")
+        return
+
+    try:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", tmux_name],
+            timeout=5, capture_output=True,
+        )
+        send_to_topic(topic_id, f"\u274c Stopped <b>{tmux_name}</b>")
+        logger.info(f"Killed tmux session {tmux_name}")
+    except Exception as e:
+        logger.error(f"Failed to kill tmux session {tmux_name}: {e}")
+        send_to_topic(topic_id, f"\u274c Failed to stop <b>{tmux_name}</b>")
 
 
 def handle_help_command(topic_id=None):
@@ -298,7 +509,9 @@ def handle_help_command(topic_id=None):
         "<b>Forum Topics Mode:</b>\n"
         "Each session has its own topic. Just type your reply in the topic \u2014 no prefix needed.\n\n"
         "<b>Bridge Commands (tel_):</b>\n"
-        "/tel_sessions - List Zellij sessions\n"
+        "/tel_sessions - List sessions\n"
+        "/tel_session_start - Start tmux + Claude session\n"
+        "/tel_session_end - Stop tmux session\n"
         "/tel_rename &lt;name&gt; - Rename session/topic\n"
         "/tel_help - Show this help\n\n"
         "<b>Claude Code Commands:</b>\n"
@@ -344,6 +557,12 @@ def process_message(message):
     if text.startswith("/tel_sessions"):
         handle_sessions_command(topic_id)
         return
+    if text.startswith("/tel_session_start"):
+        handle_session_start(topic_id)
+        return
+    if text.startswith("/tel_session_end"):
+        handle_session_end(topic_id)
+        return
     if text.startswith("/tel_rename"):
         handle_rename_command(topic_id, text[len("/tel_rename"):])
         return
@@ -372,7 +591,10 @@ def process_message(message):
         return
 
     if not is_session_alive(tmux_session):
-        send_to_topic(topic_id, f"\u26a0\ufe0f <b>{tmux_session}</b> is not running.\nStart with: <code>tmux new -s {tmux_session} 'claude -r'</code>")
+        # Offer to start the session
+        send_to_topic(topic_id,
+            f"\u26a0\ufe0f <b>{tmux_session}</b> is not running.\n"
+            f"Use /tel_session_start to start it.")
         return
 
     msg_id = message.get("message_id")
@@ -450,6 +672,84 @@ def process_callback_query(callback_query):
 
     # Get the bot's message_id (the message with inline buttons)
     cb_msg_id = callback_query.get("message", {}).get("message_id")
+
+    if action_type == "start":
+        claude_session_id = parts[3] if len(parts) >= 4 else "_"
+        cwd = session_info.get("cwd", os.path.expanduser("~"))
+        if not cwd or not os.path.isdir(cwd):
+            cwd = os.path.expanduser("~")
+
+        if action_value == "delete_menu":
+            # Show delete picker
+            claude_sessions = list_claude_sessions(cwd)
+            if not claude_sessions:
+                telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "No sessions to delete"})
+                return
+            buttons = []
+            for cs in claude_sessions[:8]:
+                if cs["name"]:
+                    label = cs["name"]
+                elif cs["first_msg"]:
+                    label = cs["first_msg"]
+                else:
+                    label = cs["id"][:8]
+                if len(label) > 22:
+                    label = label[:19] + "..."
+                label = f"{label} ({cs['age']}, {cs['size']})"
+                buttons.append([{"text": f"\U0001F5D1 {label}", "callback_data": f"{session_name}|start|delete|{cs['id']}"}])
+            buttons.append([{"text": "\u2b05 Back", "callback_data": f"{session_name}|start|back|_"}])
+            # Edit the existing message to show delete picker
+            cb_msg_id = callback_query.get("message", {}).get("message_id")
+            if cb_msg_id:
+                try:
+                    telegram_api("editMessageText", {
+                        "chat_id": GROUP_CHAT_ID,
+                        "message_id": cb_msg_id,
+                        "text": f"\U0001F5D1 <b>Delete a Claude session:</b>\n<i>{cwd}</i>",
+                        "parse_mode": "HTML",
+                        "reply_markup": {"inline_keyboard": buttons},
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to edit message for delete menu: {e}")
+            telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Select session to delete"})
+            return
+
+        if action_value == "delete" and claude_session_id != "_":
+            # Delete the JSONL session file
+            project_dir = cwd_to_project_dir(cwd)
+            session_file = os.path.join(project_dir, f"{claude_session_id}.jsonl")
+            try:
+                os.remove(session_file)
+                telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Session deleted"})
+                send_to_topic(topic_id, f"\U0001F5D1 Deleted session <code>{claude_session_id[:8]}</code>")
+                logger.info(f"Deleted Claude session file: {session_file}")
+            except FileNotFoundError:
+                telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Session not found"})
+            except OSError as e:
+                telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"Delete failed: {e}"})
+            return
+
+        if action_value == "back":
+            # Go back to the start menu — re-trigger session start
+            handle_session_start(topic_id)
+            telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": ""})
+            return
+
+        if action_value == "resume" and claude_session_id != "_":
+            claude_args = f"--resume {claude_session_id}"
+            label = "Resuming session"
+        else:
+            claude_args = ""
+            label = "New session"
+
+        telegram_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": f"{label}..."})
+
+        if start_tmux_with_claude(tmux_session, cwd, claude_args):
+            send_to_topic(topic_id, f"\u2705 Started <b>{tmux_session}</b>\n{label}")
+            logger.info(f"Started tmux {tmux_session} in {cwd} with: claude {claude_args}")
+        else:
+            send_to_topic(topic_id, f"\u274c Failed to start <b>{tmux_session}</b>")
+        return
 
     if action_type == "perm":
         # Permission prompt: use Y/N keys or arrow navigation
