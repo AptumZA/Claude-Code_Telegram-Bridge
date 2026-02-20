@@ -217,10 +217,22 @@ def handle_help_command(topic_id=None):
         "<b>Telegram-Claude Bridge</b>\n\n"
         "<b>Forum Topics Mode:</b>\n"
         "Each session has its own topic. Just type your reply in the topic \u2014 no prefix needed.\n\n"
-        "<b>Commands:</b>\n"
+        "<b>Bridge Commands:</b>\n"
         "/sessions - List active sessions\n"
-        "/help - Show this help"
+        "/help - Show this help\n\n"
+        "<b>Claude Code Commands:</b>\n"
+        "All other /<i>command</i> entries in the menu are forwarded to the Claude Code session "
+        "linked to this topic (e.g. /compact, /init, /model)."
     )
+
+
+# Claude Code slash commands that get forwarded to the Zellij session
+CLAUDE_COMMANDS = {
+    "clear", "compact", "config", "context", "cost", "debug", "doctor",
+    "exit", "export", "init", "mcp", "memory", "model", "permissions",
+    "plan", "rename", "resume", "rewind", "stats", "status", "statusline",
+    "copy", "tasks", "theme", "todos", "usage", "vim",
+}
 
 
 def is_authorized(message):
@@ -247,13 +259,17 @@ def process_message(message):
 
     logger.info(f"Received in topic {topic_id}: {text}")
 
-    # Handle commands
+    # Handle bridge commands
     if text.startswith("/sessions"):
         handle_sessions_command(topic_id)
         return
     if text.startswith("/help") or text.startswith("/start"):
         handle_help_command(topic_id)
         return
+
+    # Check if this is a Claude Code slash command to forward
+    cmd_word = text.split()[0].lstrip("/").split("@")[0] if text.startswith("/") else None
+    is_claude_cmd = cmd_word in CLAUDE_COMMANDS if cmd_word else False
 
     # Find session by topic
     session_name, session_info = find_session_by_topic(topic_id)
@@ -269,6 +285,16 @@ def process_message(message):
     zellij_session = session_info.get("zellij_session", "")
     if not zellij_session:
         send_to_topic(topic_id, f"\u26a0\ufe0f Session <b>{session_name}</b> has no Zellij session.")
+        return
+
+    # Claude Code slash commands: forward as-is (no [Telegram] prefix)
+    if is_claude_cmd:
+        slash_cmd = f"/{cmd_word}"
+        if inject_into_zellij(zellij_session, slash_cmd):
+            send_to_topic(topic_id, f"\u2705 <code>{slash_cmd}</code>")
+            logger.info(f"Claude command injected into {zellij_session}: {slash_cmd}")
+        else:
+            send_to_topic(topic_id, f"\u274c Failed to send. Is the Zellij session alive?")
         return
 
     # Inject into Zellij with [Telegram] prefix
